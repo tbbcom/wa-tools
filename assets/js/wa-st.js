@@ -1,0 +1,815 @@
+(() => {
+  // ---------- ELEMENTS ----------
+  const $ = (id) => document.getElementById(id);
+  const iFile = $("iFile");
+  const iDrop = $("iDrop");
+  const stage = document.querySelector(".i-stage");
+  const canvas = $("iCanvas");
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+  // History
+  const iUndo = $("iUndo");
+  const iRedo = $("iRedo");
+  const iReset = $("iReset");
+
+  // Size & Fit
+  const sizeRadios = [...document.querySelectorAll('input[name="iSizePreset"]')];
+  const iSize = $("iSize");
+  const fitButtons = [...document.querySelectorAll('button[data-fit]')];
+  const iRotateLeft = $("iRotateLeft");
+  const iRotateRight = $("iRotateRight");
+  const iFlipH = $("iFlipH");
+  const iFlipV = $("iFlipV");
+  const iSafeArea = $("iSafeArea");
+
+  // Crop & Trim
+  const iCropMode = $("iCropMode");
+  const iApplyCrop = $("iApplyCrop");
+  const iAutoTrim = $("iAutoTrim");
+
+  // BG Removal
+  const iPickColor = $("iPickColor");
+  const iTolerance = $("iTolerance");
+  const iTolVal = $("iTolVal");
+  const iApplyBG = $("iApplyBG");
+  const iAutoBG = $("iAutoBG");
+
+  // Outline & Shadow
+  const iOutlineColor = $("iOutlineColor");
+  const iOutlineW = $("iOutlineW");
+  const iOutlineWVal = $("iOutlineWVal");
+  const iApplyOutline = $("iApplyOutline");
+  const iShadowColor = $("iShadowColor");
+  const iShadowBlur = $("iShadowBlur");
+  const iShadowX = $("iShadowX");
+  const iShadowY = $("iShadowY");
+  const iShBlurVal = $("iShBlurVal");
+  const iShXVal = $("iShXVal");
+  const iShYVal = $("iShYVal");
+  const iApplyShadow = $("iApplyShadow");
+
+  // Text
+  const iText = $("iText");
+  const iTextSize = $("iTextSize");
+  const iTextFill = $("iTextFill");
+  const iTextStroke = $("iTextStroke");
+  const iTextStrokeW = $("iTextStrokeW");
+  const iTextStrokeWVal = $("iTextStrokeWVal");
+  const iAddText = $("iAddText");
+  const iCommitText = $("iCommitText");
+
+  // Export
+  const iExport = $("iExport");
+  const iAddToPack = $("iAddToPack");
+  const iTargetKB = $("iTargetKB");
+  const iKBTarget = $("iKBTarget");
+  const iTray = $("iTray");
+  const iTrayCollage = $("iTrayCollage");
+
+  // Pack
+  const iPackName = $("iPackName");
+  const iPackPublisher = $("iPackPublisher");
+  const iPackList = $("iPackList");
+  const iDownloadAll = $("iDownloadAll");
+  const iDownloadZip = $("iDownloadZip");
+
+  // ---------- STATE ----------
+  let originalImg = null;           // The last loaded image element
+  let baseFit = "contain";          // 'contain' | 'cover'
+  let isSafe = false;
+
+  // History stacks (dataURL of PNG to avoid webp losses)
+  const HISTORY_LIMIT = 40;
+  const undoStack = [];
+  const redoStack = [];
+
+  // Crop state
+  let cropMode = false;
+  let cropStart = null;
+  let cropRect = null;
+  const overlay = createOverlay();  // visual selection rectangle
+
+  // Text state (drag preview)
+  let pendingText = null;           // {text,x,y,size,fill,stroke,strokeW}
+  let draggingText = false;
+  let dragOffset = { x: 0, y: 0 };
+  let textBaselineSnapshot = null;  // ImageData before preview text
+
+  // Stickers pack
+  const stickers = []; // Array<{blob: Blob, url: string}>
+
+  // ---------- UTIL ----------
+  function createOverlay() {
+    const el = document.createElement("div");
+    el.style.position = "absolute";
+    el.style.inset = "0";
+    el.style.pointerEvents = "none";
+    el.style.border = "none";
+    el.style.display = "block";
+    stage.appendChild(el);
+    return el;
+  }
+
+  function clearOverlay() {
+    overlay.style.boxShadow = "none";
+    overlay.style.border = "none";
+    overlay.style.background = "none";
+  }
+
+  function setSelectionRect(x, y, w, h) {
+    overlay.style.left = x + "px";
+    overlay.style.top = y + "px";
+    overlay.style.right = (canvas.width - x - w) + "px";
+    overlay.style.bottom = (canvas.height - y - h) + "px";
+    overlay.style.position = "absolute";
+    overlay.style.border = "1px dashed #2f81f7";
+    overlay.style.boxShadow = "0 0 0 99999px rgba(0,0,0,0.35) inset";
+  }
+
+  function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+  function pushHistory() {
+    // Store PNG to preserve lossless edits
+    try {
+      const snapshot = canvas.toDataURL("image/png");
+      undoStack.push(snapshot);
+      if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
+      redoStack.length = 0;
+      updateHistoryButtons();
+    } catch (e) {
+      console.warn("History snapshot failed:", e);
+    }
+  }
+
+  function restoreFromDataURL(dataURL) {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve();
+      };
+      img.src = dataURL;
+    });
+  }
+
+  function updateHistoryButtons() {
+    iUndo.disabled = undoStack.length === 0;
+    iRedo.disabled = redoStack.length === 0;
+    iReset.disabled = !originalImg;
+  }
+
+  function setCanvasSize(n) {
+    const prev = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    canvas.width = canvas.height = n;
+    ctx.putImageData(prev, 0, 0); // best effort; content may be clipped/scaled by user ops thereafter
+  }
+
+  function drawFromOriginal() {
+    if (!originalImg) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const { sx, sy, sw, sh, dx, dy, dw, dh } = objectFitRect(baseFit, originalImg.width, originalImg.height, canvas.width, canvas.height);
+    ctx.drawImage(originalImg, sx, sy, sw, sh, dx, dy, dw, dh);
+  }
+
+  function objectFitRect(mode, iw, ih, cw, ch) {
+    const ir = iw / ih, cr = cw / ch;
+    let sw=iw, sh=ih, sx=0, sy=0, dw=cw, dh=ch, dx=0, dy=0;
+
+    if (mode === "contain") {
+      if (ir > cr) { dw = cw; dh = Math.round(cw / ir); dy = Math.round((ch - dh)/2); }
+      else { dh = ch; dw = Math.round(ch * ir); dx = Math.round((cw - dw)/2); }
+    } else { // cover
+      if (ir > cr) { sh = Math.round(ih * (cr/ir)); sy = Math.round((ih - sh)/2); }
+      else { sw = Math.round(iw * (ir/cr)); sx = Math.round((iw - sw)/2); }
+    }
+    return { sx, sy, sw, sh, dx, dy, dw, dh };
+  }
+
+  function getMousePos(evt) {
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    return {
+      x: Math.floor((evt.clientX - rect.left) * scaleX),
+      y: Math.floor((evt.clientY - rect.top) * scaleY),
+    };
+  }
+
+  function rgbToHex(r, g, b) {
+    return "#" + [r, g, b].map(v => v.toString(16).padStart(2, "0")).join("");
+  }
+
+  function colorDist(c1, c2) {
+    // Euclidean in sRGB
+    const dr = c1[0] - c2[0];
+    const dg = c1[1] - c2[1];
+    const db = c1[2] - c2[2];
+    return Math.sqrt(dr*dr + dg*dg + db*db); // 0 .. ~441.67
+  }
+
+  function removeColorNear(targetRGB, tol) {
+    const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const data = img.data;
+    const threshold = tol / 100 * 442;
+    for (let i = 0; i < data.length; i += 4) {
+      const d = colorDist([data[i], data[i+1], data[i+2]], targetRGB);
+      if (d <= threshold) data[i+3] = 0;
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+
+  function sampleAt(x, y) {
+    const d = ctx.getImageData(x, y, 1, 1).data;
+    return [d[0], d[1], d[2], d[3]];
+  }
+
+  function autoTrim(padding = 8) {
+    const w = canvas.width, h = canvas.height;
+    const img = ctx.getImageData(0, 0, w, h);
+    const d = img.data;
+    let minX = w, minY = h, maxX = 0, maxY = 0;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = (y*w + x) * 4 + 3;
+        if (d[i] > 8) { // alpha > ~3%
+          if (x < minX) minX = x;
+          if (y < minY) minY = y;
+          if (x > maxX) maxX = x;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+    if (maxX <= minX || maxY <= minY) return; // nothing
+
+    minX = clamp(minX - padding, 0, w);
+    minY = clamp(minY - padding, 0, h);
+    maxX = clamp(maxX + padding, 0, w);
+    maxY = clamp(maxY + padding, 0, h);
+
+    const cw = maxX - minX, ch = maxY - minY;
+    const cut = ctx.getImageData(minX, minY, cw, ch);
+
+    // Draw back to full square, maximized
+    ctx.clearRect(0, 0, w, h);
+    const ir = cw / ch, cr = w / h;
+    let dw=w, dh=h, dx=0, dy=0;
+    if (ir > cr) { dw = w; dh = Math.round(w/ir); dy = Math.round((h-dh)/2); }
+    else { dh = h; dw = Math.round(h*ir); dx = Math.round((w-dw)/2); }
+    const tmp = document.createElement("canvas");
+    tmp.width = cw; tmp.height = ch;
+    tmp.getContext("2d").putImageData(cut, 0, 0);
+    ctx.drawImage(tmp, 0, 0, cw, ch, dx, dy, dw, dh);
+  }
+
+  function applyOutline(color, widthPx) {
+    // Blur-based glow underlay for a smooth sticker outline
+    const w = canvas.width, h = canvas.height;
+    const tmp = document.createElement("canvas");
+    tmp.width = w; tmp.height = h;
+    const tctx = tmp.getContext("2d");
+
+    // Draw current content into tmp
+    tctx.drawImage(canvas, 0, 0);
+
+    // Draw blurred underlay on main canvas
+    ctx.save();
+    ctx.clearRect(0, 0, w, h);
+    ctx.filter = `blur(${Math.max(1, widthPx)}px)`;
+    ctx.globalCompositeOperation = "source-over";
+    ctx.drawImage(tmp, 0, 0);
+    ctx.filter = "none";
+
+    // Colorize the blur
+    // Fill a solid rect, keep only where alpha exists
+    ctx.globalCompositeOperation = "source-in";
+    ctx.fillStyle = color;
+    ctx.fillRect(0, 0, w, h);
+
+    // Put the original on top
+    ctx.globalCompositeOperation = "destination-over";
+    ctx.drawImage(tmp, 0, 0);
+
+    ctx.restore();
+    ctx.globalCompositeOperation = "source-over";
+  }
+
+  function applyShadow(color, blur, ox, oy) {
+    const w = canvas.width, h = canvas.height;
+    const tmp = document.createElement("canvas");
+    tmp.width = w; tmp.height = h;
+    tmp.getContext("2d").drawImage(canvas, 0, 0);
+
+    ctx.clearRect(0, 0, w, h);
+    ctx.save();
+    ctx.shadowColor = color;
+    ctx.shadowBlur = blur;
+    ctx.shadowOffsetX = ox;
+    ctx.shadowOffsetY = oy;
+    ctx.drawImage(tmp, 0, 0);
+    ctx.restore();
+  }
+
+  function rotate90(dir = 1) {
+    const w = canvas.width, h = canvas.height;
+    const tmp = document.createElement("canvas");
+    tmp.width = w; tmp.height = h;
+    tmp.getContext("2d").drawImage(canvas, 0, 0);
+
+    ctx.clearRect(0, 0, w, h);
+    ctx.save();
+    ctx.translate(w/2, h/2);
+    ctx.rotate((Math.PI/2) * dir);
+    ctx.drawImage(tmp, -w/2, -h/2);
+    ctx.restore();
+  }
+
+  function flip(horizontal = true) {
+    const w = canvas.width, h = canvas.height;
+    const tmp = document.createElement("canvas");
+    tmp.width = w; tmp.height = h;
+    tmp.getContext("2d").drawImage(canvas, 0, 0);
+
+    ctx.clearRect(0, 0, w, h);
+    ctx.save();
+    ctx.translate(horizontal ? w : 0, horizontal ? 0 : h);
+    ctx.scale(horizontal ? -1 : 1, horizontal ? 1 : -1);
+    ctx.drawImage(tmp, 0, 0);
+    ctx.restore();
+  }
+
+  function exportUnderKB(targetKB) {
+    return new Promise((resolve) => {
+      const maxBytes = targetKB * 1024;
+      let lo = 0.5, hi = 0.98, best = null;
+
+      const testQ = (q, cb) => canvas.toBlob((b) => cb(b), "image/webp", q);
+
+      const step = () => {
+        if (lo > hi) { return resolve(best); }
+        const mid = (lo + hi) / 2;
+        testQ(mid, (blob) => {
+          if (!blob) { hi = mid - 0.05; return step(); }
+          if (blob.size <= maxBytes) { best = blob; lo = mid + 0.02; }
+          else { hi = mid - 0.02; }
+          step();
+        });
+      };
+      step();
+    });
+  }
+
+  function ensureJSZip() {
+    if (!window.JSZip) throw new Error("JSZip is not loaded. Keep the CDN <script> you already have.");
+  }
+
+  function enableEditing(enabled) {
+    const allButtons = document.querySelectorAll(".ibtn");
+    allButtons.forEach(b => {
+      if (b.id === "iExport" || b.id === "iAddToPack") return;
+      b.disabled = !enabled;
+    });
+    iExport.disabled = !enabled;
+    iAddToPack.disabled = !enabled;
+  }
+
+  function resetAll() {
+    if (!originalImg) return;
+    baseFit = "contain";
+    drawFromOriginal();
+    cropMode = false; cropStart = null; cropRect = null;
+    clearOverlay();
+    pendingText = null;
+    iCommitText.disabled = true;
+    pushHistory();
+  }
+
+  // ---------- LOAD / INPUT ----------
+  function loadFile(file) {
+    if (!file) return;
+    const img = new Image();
+    img.onload = () => {
+      originalImg = img;
+      // Resize canvas to chosen size
+      const chosen = parseInt(iSize.value || "512", 10);
+      setCanvasSize(clamp(chosen, 128, 1024));
+      drawFromOriginal();
+      undoStack.length = 0; redoStack.length = 0; pushHistory();
+      enableEditing(true);
+    };
+    img.src = URL.createObjectURL(file);
+  }
+
+  iFile.addEventListener("change", (e) => loadFile(e.target.files[0]));
+  iDrop.addEventListener("click", () => iFile.click());
+  iDrop.addEventListener("dragover", (e) => { e.preventDefault(); iDrop.classList.add("hover"); });
+  iDrop.addEventListener("dragleave", () => iDrop.classList.remove("hover"));
+  iDrop.addEventListener("drop", (e) => {
+    e.preventDefault(); iDrop.classList.remove("hover");
+    if (e.dataTransfer.files?.length) loadFile(e.dataTransfer.files[0]);
+  });
+  // Paste
+  document.addEventListener("paste", async (e) => {
+    const items = e.clipboardData?.items || [];
+    for (const it of items) {
+      if (it.type.startsWith("image/")) {
+        const file = it.getAsFile();
+        loadFile(file);
+        break;
+      }
+    }
+  });
+
+  // ---------- HISTORY ----------
+  iUndo.addEventListener("click", async () => {
+    if (!undoStack.length) return;
+    const curr = canvas.toDataURL("image/png");
+    redoStack.push(curr);
+    const prev = undoStack.pop();
+    if (prev) await restoreFromDataURL(prev);
+    updateHistoryButtons();
+  });
+  iRedo.addEventListener("click", async () => {
+    if (!redoStack.length) return;
+    const curr = canvas.toDataURL("image/png");
+    undoStack.push(curr);
+    const next = redoStack.pop();
+    if (next) await restoreFromDataURL(next);
+    updateHistoryButtons();
+  });
+  iReset.addEventListener("click", resetAll);
+
+  // ---------- SIZE & FIT ----------
+  sizeRadios.forEach(r => r.addEventListener("change", () => {
+    if (r.checked && r.value !== "custom") {
+      iSize.value = r.value;
+      setCanvasSize(parseInt(r.value, 10));
+      if (originalImg) { drawFromOriginal(); pushHistory(); }
+    }
+  }));
+  iSize.addEventListener("change", () => {
+    const n = clamp(parseInt(iSize.value || "512", 10), 128, 1024);
+    setCanvasSize(n);
+    // Redraw content scaled to new canvas (simple nearest)
+    // (Keep as-is to preserve current edits)
+    pushHistory();
+    // switch radio to custom
+    sizeRadios.forEach(r => r.checked = (r.value === "custom"));
+  });
+  fitButtons.forEach(btn => btn.addEventListener("click", () => {
+    if (!originalImg) return;
+    baseFit = btn.dataset.fit;
+    drawFromOriginal();
+    pushHistory();
+  }));
+  iRotateLeft.addEventListener("click", () => { rotate90(-1); pushHistory(); });
+  iRotateRight.addEventListener("click", () => { rotate90(1); pushHistory(); });
+  iFlipH.addEventListener("click", () => { flip(true); pushHistory(); });
+  iFlipV.addEventListener("click", () => { flip(false); pushHistory(); });
+
+  iSafeArea.addEventListener("click", () => {
+    isSafe = !isSafe;
+    stage.dataset.safe = isSafe ? "1" : "0";
+  });
+
+  // ---------- CROP ----------
+  iCropMode.addEventListener("click", () => {
+    cropMode = !cropMode;
+    cropStart = null; cropRect = null;
+    clearOverlay();
+    iCropMode.classList.toggle("ibtn-primary", cropMode);
+  });
+
+  iApplyCrop.addEventListener("click", () => {
+    if (!cropRect) return;
+    const { x, y, w, h } = cropRect;
+    if (w <= 2 || h <= 2) return;
+    const cut = ctx.getImageData(x, y, w, h);
+    const tmp = document.createElement("canvas");
+    tmp.width = w; tmp.height = h;
+    tmp.getContext("2d").putImageData(cut, 0, 0);
+
+    // Fit cropped content back to square canvas, maximize
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const ir = w / h, cr = 1;
+    let dw=canvas.width, dh=canvas.height, dx=0, dy=0;
+    if (ir > cr) { dw = canvas.width; dh = Math.round(dw / ir); dy = Math.round((canvas.height - dh)/2); }
+    else { dh = canvas.height; dw = Math.round(dh * ir); dx = Math.round((canvas.width - dw)/2); }
+    ctx.drawImage(tmp, 0, 0, w, h, dx, dy, dw, dh);
+
+    cropMode = false; cropRect = null; cropStart = null; clearOverlay();
+    iCropMode.classList.remove("ibtn-primary");
+    pushHistory();
+  });
+
+  iAutoTrim.addEventListener("click", () => { autoTrim(); pushHistory(); });
+
+  // Canvas mouse for crop + color pick + text drag
+  canvas.addEventListener("mousedown", (e) => {
+    const p = getMousePos(e);
+    if (pendingText) {
+      // hit test approx by measuring text bounds
+      const m = measureText(pendingText);
+      if (pointInRect(p.x, p.y, pendingText.x - m.w/2, pendingText.y - m.h/2, m.w, m.h)) {
+        draggingText = true;
+        dragOffset.x = p.x - pendingText.x;
+        dragOffset.y = p.y - pendingText.y;
+        return;
+      }
+    }
+    if (!cropMode) return;
+    cropStart = p;
+    cropRect = { x: p.x, y: p.y, w: 0, h: 0 };
+  });
+
+  canvas.addEventListener("mousemove", (e) => {
+    const p = getMousePos(e);
+    if (draggingText && pendingText) {
+      pendingText.x = p.x - dragOffset.x;
+      pendingText.y = p.y - dragOffset.y;
+      renderTextPreview();
+      return;
+    }
+    if (!cropMode || !cropStart) return;
+    const x = Math.min(cropStart.x, p.x);
+    const y = Math.min(cropStart.y, p.y);
+    const w = Math.abs(p.x - cropStart.x);
+    const h = Math.abs(p.y - cropStart.y);
+    cropRect = { x, y, w, h };
+    setSelectionRect(x, y, w, h);
+  });
+
+  document.addEventListener("mouseup", () => {
+    draggingText = false;
+    cropStart = null;
+  });
+
+  // Color pick (click when not cropping or dragging text)
+  canvas.addEventListener("click", (e) => {
+    if (cropMode || pendingText) return;
+    const p = getMousePos(e);
+    const d = ctx.getImageData(p.x, p.y, 1, 1).data;
+    iPickColor.value = rgbToHex(d[0], d[1], d[2]);
+  });
+
+  // ---------- BACKGROUND REMOVAL ----------
+  iTolVal.textContent = iTolerance.value;
+  iTolerance.addEventListener("input", () => iTolVal.textContent = iTolerance.value);
+
+  iApplyBG.addEventListener("click", () => {
+    const hex = iPickColor.value;
+    const rgb = [parseInt(hex.slice(1,3),16), parseInt(hex.slice(3,5),16), parseInt(hex.slice(5,7),16)];
+    removeColorNear(rgb, parseInt(iTolerance.value, 10));
+    pushHistory();
+  });
+
+  iAutoBG.addEventListener("click", () => {
+    const w = canvas.width, h = canvas.height;
+    const pts = [[1,1],[w-2,1],[1,h-2],[w-2,h-2]];
+    const tol = parseInt(iTolerance.value, 10);
+    const seen = new Set();
+    for (const [x,y] of pts) {
+      const rgba = sampleAt(x, y);
+      const key = rgba.slice(0,3).join(",");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      removeColorNear([rgba[0],rgba[1],rgba[2]], tol);
+    }
+    pushHistory();
+  });
+
+  // ---------- OUTLINE & SHADOW ----------
+  iOutlineWVal.textContent = iOutlineW.value;
+  iOutlineW.addEventListener("input", () => iOutlineWVal.textContent = iOutlineW.value);
+  iApplyOutline.addEventListener("click", () => { applyOutline(iOutlineColor.value, parseInt(iOutlineW.value,10)); pushHistory(); });
+
+  const syncShadowLabels = () => {
+    iShBlurVal.textContent = iShadowBlur.value;
+    iShXVal.textContent = iShadowX.value;
+    iShYVal.textContent = iShadowY.value;
+  };
+  ["input","change"].forEach(ev => {
+    iShadowBlur.addEventListener(ev, syncShadowLabels);
+    iShadowX.addEventListener(ev, syncShadowLabels);
+    iShadowY.addEventListener(ev, syncShadowLabels);
+  });
+  syncShadowLabels();
+  iApplyShadow.addEventListener("click", () => {
+    applyShadow(iShadowColor.value, parseInt(iShadowBlur.value,10), parseInt(iShadowX.value,10), parseInt(iShadowY.value,10));
+    pushHistory();
+  });
+
+  // ---------- TEXT ----------
+  iTextStrokeWVal.textContent = iTextStrokeW.value;
+  iTextStrokeW.addEventListener("input", () => iTextStrokeWVal.textContent = iTextStrokeW.value);
+
+  iAddText.addEventListener("click", () => {
+    if (!originalImg) return;
+    pendingText = {
+      text: iText.value || "Your text",
+      x: Math.round(canvas.width/2),
+      y: Math.round(canvas.height*0.8),
+      size: parseInt(iTextSize.value,10) || 64,
+      fill: iTextFill.value,
+      stroke: iTextStroke.value,
+      strokeW: parseInt(iTextStrokeW.value,10) || 4,
+      font: "700 system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
+    };
+    textBaselineSnapshot = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    iCommitText.disabled = false;
+    renderTextPreview();
+  });
+
+  ["input","change"].forEach(ev => {
+    [iText, iTextSize, iTextFill, iTextStroke, iTextStrokeW].forEach(el =>
+      el.addEventListener(ev, () => { if (pendingText) { updatePendingFromUI(); renderTextPreview(); } })
+    );
+  });
+
+  function updatePendingFromUI() {
+    pendingText.text = iText.value || pendingText.text;
+    pendingText.size = parseInt(iTextSize.value,10) || pendingText.size;
+    pendingText.fill = iTextFill.value;
+    pendingText.stroke = iTextStroke.value;
+    pendingText.strokeW = parseInt(iTextStrokeW.value,10) || pendingText.strokeW;
+  }
+
+  function measureText(pt) {
+    const tctx = canvas.getContext("2d");
+    tctx.save();
+    tctx.font = `${pt.font.includes(" ") ? "" : "700 "} ${pt.size}px ${pt.font}`;
+    const metrics = tctx.measureText(pt.text);
+    const w = Math.ceil(metrics.width) + pt.strokeW*2;
+    const h = Math.ceil(pt.size + pt.strokeW*2);
+    tctx.restore();
+    return { w, h };
+  }
+
+  function renderTextPreview() {
+    if (!pendingText || !textBaselineSnapshot) return;
+    ctx.putImageData(textBaselineSnapshot, 0, 0);
+    ctx.save();
+    ctx.font = `${pendingText.size}px ${pendingText.font}`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    if (pendingText.strokeW > 0) {
+      ctx.lineJoin = "round";
+      ctx.lineWidth = pendingText.strokeW;
+      ctx.strokeStyle = pendingText.stroke;
+      ctx.strokeText(pendingText.text, pendingText.x, pendingText.y);
+    }
+    ctx.fillStyle = pendingText.fill;
+    ctx.fillText(pendingText.text, pendingText.x, pendingText.y);
+    ctx.restore();
+  }
+
+  function pointInRect(px, py, rx, ry, rw, rh) {
+    return px >= rx && px <= rx+rw && py >= ry && py <= ry+rh;
+  }
+
+  iCommitText.addEventListener("click", () => {
+    if (!pendingText) return;
+    // The preview is already drawn; just freeze it by discarding snapshot
+    pendingText = null;
+    textBaselineSnapshot = null;
+    iCommitText.disabled = true;
+    pushHistory();
+  });
+
+  // ---------- EXPORT / TRAY ----------
+  iKBTarget.textContent = iTargetKB.value;
+  iTargetKB.addEventListener("input", () => iKBTarget.textContent = iTargetKB.value);
+
+  iExport.addEventListener("click", async () => {
+    if (!originalImg) return;
+    const target = parseInt(iTargetKB.value, 10);
+    let blob = await exportUnderKB(target);
+    if (!blob) {
+      // Fallback best effort
+      await new Promise(res => canvas.toBlob(b => { blob = b; res(); }, "image/webp", 0.9));
+    }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "sticker.webp"; a.click();
+    URL.revokeObjectURL(url);
+  });
+
+  iAddToPack.addEventListener("click", () => {
+    if (!originalImg) return;
+    canvas.toBlob((blob) => {
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      stickers.push({ blob, url });
+      addThumb(url, stickers.length - 1);
+    }, "image/webp", 0.95);
+  });
+
+  function addThumb(url, idx) {
+    const wrap = document.createElement("div");
+    wrap.className = "i-thumb";
+    const img = document.createElement("img");
+    img.src = url;
+    const del = document.createElement("button");
+    del.className = "i-del";
+    del.textContent = "×";
+    del.title = "Remove";
+    del.addEventListener("click", () => {
+      URL.revokeObjectURL(stickers[idx]?.url);
+      stickers.splice(idx,1);
+      iPackList.removeChild(wrap);
+      // Reindex delete handlers
+      [...iPackList.children].forEach((el, i) => {
+        const btn = el.querySelector(".i-del");
+        btn.onclick = () => {
+          URL.revokeObjectURL(stickers[i]?.url);
+          stickers.splice(i,1);
+          iPackList.removeChild(el);
+        };
+      });
+    });
+    wrap.appendChild(img);
+    wrap.appendChild(del);
+    iPackList.appendChild(wrap);
+  }
+
+  iDownloadAll.addEventListener("click", () => {
+    stickers.forEach((s, i) => {
+      const a = document.createElement("a");
+      a.href = s.url;
+      a.download = `sticker_${i+1}.webp`;
+      a.click();
+    });
+  });
+
+  iDownloadZip.addEventListener("click", async () => {
+    if (!stickers.length) return;
+    ensureJSZip();
+    const zip = new JSZip();
+    const meta = {
+      name: iPackName.value?.trim() || "My_Stickers",
+      publisher: iPackPublisher.value?.trim() || "Unknown"
+    };
+    zip.file("pack.txt", `Pack: ${meta.name}\nPublisher: ${meta.publisher}\nCount: ${stickers.length}\n`);
+    stickers.forEach((s, i) => zip.file(`sticker_${i+1}.webp`, s.blob));
+    const blob = await zip.generateAsync({ type: "blob" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${meta.name.replace(/\s+/g,"_")}.zip`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  });
+
+  iTray.addEventListener("click", () => {
+    const small = document.createElement("canvas");
+    small.width = small.height = 96;
+    small.getContext("2d").drawImage(canvas, 0, 0, 96, 96);
+    small.toBlob((b) => {
+      const url = URL.createObjectURL(b);
+      const a = document.createElement("a");
+      a.href = url; a.download = "tray_96.webp"; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+    }, "image/webp", 0.9);
+  });
+
+  iTrayCollage.addEventListener("click", async () => {
+    const small = document.createElement("canvas");
+    small.width = small.height = 96;
+    const sctx = small.getContext("2d");
+    sctx.clearRect(0,0,96,96);
+    const items = stickers.length ? stickers.slice(-9) : [{blob: await new Promise(res => canvas.toBlob(res, "image/webp", 0.9))}];
+    const imgs = await Promise.all(items.map(b2img));
+    const cell = 32, pad = 0;
+    imgs.forEach((im, idx) => {
+      const gx = idx % 3, gy = Math.floor(idx/3);
+      sctx.drawImage(im, gx*cell+pad, gy*cell+pad, cell-2*pad, cell-2*pad);
+    });
+    small.toBlob((b) => {
+      const url = URL.createObjectURL(b);
+      const a = document.createElement("a");
+      a.href = url; a.download = "tray_collage_3x3.webp"; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+    }, "image/webp", 0.9);
+  });
+
+  function b2img(item) {
+    return new Promise((resolve) => {
+      if (item.url) {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.src = item.url;
+      } else if (item instanceof Blob) {
+        const url = URL.createObjectURL(item);
+        const img = new Image();
+        img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+        img.src = url;
+      } else {
+        resolve(new Image());
+      }
+    });
+  }
+
+  // ---------- INIT ----------
+  enableEditing(false);
+  updateHistoryButtons();
+
+})();
